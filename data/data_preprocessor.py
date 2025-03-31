@@ -63,7 +63,7 @@ class DataPreprocessor:
             raise ValueError("Input must be a pandas DataFrame")
         processed_data = data.copy()
 
-        if "scalers" in self.transformers:
+        if "scaler" in self.transformers:
             num_cols = self.feature_configs["numerical"]
             if not set(num_cols).issubset(processed_data.columns):
                 raise ValueError("Numerical columns missing in data for transformation")
@@ -127,3 +127,37 @@ class DataPreprocessor:
                 returns a processed DataFrame.
         """
         self.preprocessing_steps.append(step)
+    
+    def add_time_series_features(self, data:pd.DataFrame, date_column:str) -> pd.DataFrame:
+        """
+        Add time series specific features like lag, rolling statistics, and seasonality components.
+        
+        Args:
+            data (pd.DataFrame): Input dataframe with time series data
+            date_column (str): Column containing date/time information
+            
+        Returns:
+            pd.DataFrame: DataFrame with additional time series features
+        """
+        df = data.copy()
+        if date_column in df.columns:
+            df[date_column] = pd.to_datetime(df[date_column])
+            # Extract datetime components
+            df['year'] = df[date_column].dt.year
+            df['month'] = df[date_column].dt.month
+            df['day'] = df[date_column].dt.day
+            df['day_of_week'] = df[date_column].dt.dayofweek
+            df['is_month_end'] = df[date_column].dt.is_month_end.astype(int)
+        if "numerical" in self.feature_configs:
+            for col in self.feature_configs["numerical"]:
+                for lag in [1,2,3,5,7,14,21]:
+                    df[f"{col}_lag_{lag}"] = df[col].shift(lag)
+                # Add rolling statistics
+                for window in [7,14,30]:
+                    df[f'{col}_rolling_mean_{window}'] = df[col].rolling(window=window).mean()
+                    df[f'{col}_rolling_std_{window}'] = df[col].rolling(window=window).std()
+                    
+                # Add rate of change
+                df[f'{col}_pct_change'] = df[col].pct_change()
+        return df
+    

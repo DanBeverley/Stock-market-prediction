@@ -1,3 +1,4 @@
+import numpy as np
 import pandas as pd
 from typing import List, Callable, Tuple
 from sklearn.model_selection import train_test_split
@@ -145,3 +146,41 @@ class DataLoader:
         if self.data is None:
             raise ValueError("Data not loaded. Call load_data() first")
         return self.data.describe()
+     
+    def prepare_time_series_data(self, sequence_length:int, forecast_horizon:int, features:List[str] = None) -> Tuple[np.ndarray, np.ndarray]:
+        """
+        Prepare time series data into sequences for sequence models (LSTM, GRU, SNN).
+        
+        Args:
+            sequence_length (int): Length of input sequences
+            forecast_horizon (int): Number of steps to forecast ahead
+            features (List[str]): List of feature columns to use
+            
+        Returns:
+            Tuple[np.ndarray, np.ndarray]: Input sequences and target sequences
+        """
+        if self.data is None:
+            raise ValueError("Data not loaded. Call prepare_data() first")
+        # Select features or use all except target column
+        if features:
+            if not all(feat in self.data.columns for feat in features):
+                missing = [f for f in features if f not in self.data.columns]
+                raise ValueError(f"Features not found in data: {missing}")
+        else:
+            if self.target_column:
+                data = self.data.drop(columns = [self.target_column]).values
+            else:
+                data = self.data.values
+        target = None
+        if  self.target_column:
+            target = self.data[self.target_column].values
+        
+        X, y = [], []
+        for i in range(len(data) - sequence_length - forecast_horizon + 1):
+            X.append(data[i:(i+sequence_length)])
+            if target is not None:
+                y.append(target[i + sequence_length:i + sequence_length + forecast_horizon])
+            else:
+                y.append(data[i + sequence_length: i + sequence_length + forecast_horizon])
+                
+        return np.array(X), np.array(y)

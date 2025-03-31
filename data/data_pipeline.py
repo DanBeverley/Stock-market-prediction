@@ -74,7 +74,7 @@ def generate_synthetic_data(gan_model, num_samples:int) -> np.ndarray:
         raise ValueError("Provided GAN model must have 'generate' method")
     
     synthetic_data = gan_model.generate(num_samples)
-    
+
     if isinstance(synthetic_data, np.ndarray):
         # Create DataFrame with default column names
         return pd.DataFrame(synthetic_data, columns=[f"feature_{i}" for i in range(synthetic_data.shape[1])])
@@ -83,3 +83,52 @@ def generate_synthetic_data(gan_model, num_samples:int) -> np.ndarray:
     else:
         raise ValueError("GAN model generate method must return a numpy array or a pandas DataFrame")
 
+def fetch_market_data(ticker: str, start_date: str, end_date: str, interval: str = "1d") -> pd.DataFrame:
+    """
+    Fetch market data from Yahoo Finance API.
+    
+    Args:
+        ticker (str): Stock ticker symbol
+        start_date (str): Start date in 'YYYY-MM-DD' format
+        end_date (str): End date in 'YYYY-MM-DD' format
+        interval (str): Data interval ('1d', '1wk', '1mo')
+        
+    Returns:
+        pd.DataFrame: DataFrame with market data
+    """
+    try:
+        import yfinance as yf
+        data = yf.download(ticker, start=start_date, end=end_date, interval=interval)
+        data.reset_index(inplace=True)
+        return data
+    except ImportError:
+        raise ImportError("yfinance library is required. Install with 'pip install yfinance'")
+    except Exception as e:
+        raise ValueError(f"Error fetching data for {ticker}: {str(e)}")
+
+def fetch_sentiment_data(source: str, ticker: str = None) -> pd.DataFrame:
+    """
+    Fetch sentiment data from various sources like Twitter, Reddit, etc.
+    
+    Args:
+        source (str): Source name ('twitter', 'reddit', 'news')
+        ticker (str): Stock ticker symbol to filter results
+        
+    Returns:
+        pd.DataFrame: DataFrame with sentiment data
+    """
+    if source == "twitter":
+        pass
+    elif source == "reddit":
+        pass
+    elif source == "news":
+        pass
+    
+    import random
+    dates = pd.date_range(start="2023-01-01", end="2023-01-10")
+    sentiment_data = {
+        'date': dates,
+        'sentiment_score': [random.uniform(-1, 1) for _ in range(len(dates))],
+        'volume': [random.randint(100, 10000) for _ in range(len(dates))]
+    }
+    return pd.DataFrame(sentiment_data)

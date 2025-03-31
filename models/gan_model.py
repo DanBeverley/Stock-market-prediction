@@ -13,29 +13,59 @@ class GAN:
         discriminator (keras.Model): The discriminator model.
         gan (keras.Model): The combined GAN model.
     """
-    def __init__(self, input_dim:int = 10, latent_dim:int=100) -> None:
-        """
-        Initialize the GAN with generator and discriminator models.
-
-        Args:
-            input_dim (int): The dimension of the input data.
-            latent_dim (int): The dimension of the latent space.
-        """ 
+    def __init__(self, input_dim: int = 10, latent_dim: int = 100, sequence_length: int = 20):
         self.input_dim = input_dim
         self.latent_dim = latent_dim
+        self.sequence_length = sequence_length
+        
+        # Build models
         self.generator = self._build_generator()
         self.discriminator = self._build_discriminator()
-        self.gan = self._build_gan()
+        
+        # Configure GAN
+        self.discriminator.compile(
+            optimizer=keras.optimizers.Adam(learning_rate=0.0002, beta_1=0.5),
+            loss='binary_crossentropy',
+            metrics=['accuracy']
+        )
+        
+        # For the combined model, we only train the generator
+        self.discriminator.trainable = False
+        
+        # Build combined model
+        noise = layers.Input(shape=(self.latent_dim,))
+        generated_data = self.generator(noise)
+        validity = self.discriminator(generated_data)
+        
+        self.combined = keras.Model(noise, validity)
+        self.combined.compile(
+            optimizer=keras.optimizers.Adam(learning_rate=0.0002, beta_1=0.5),
+            loss='binary_crossentropy'
+        )
     
-    def _build_generator(self) -> keras.Model:
-        model = keras.Sequential([layers.Dense(128, activation="relu", input_dim=self.latent_dim),
-                                  layers.Dense(self.input_dim, activation="tanh")])
+    def _build_generator(self):
+        model = keras.Sequential([
+            layers.Dense(256, input_dim=self.latent_dim),
+            layers.LeakyReLU(alpha=0.2),
+            layers.BatchNormalization(),
+            layers.Dense(512),
+            layers.LeakyReLU(alpha=0.2),
+            layers.BatchNormalization(),
+            layers.Dense(self.sequence_length * self.input_dim),
+            layers.Reshape((self.sequence_length, self.input_dim)),
+            layers.Activation('tanh')
+        ])
         return model
     
-    def _build_discriminator(self) -> keras.Model:
-        self.discriminator.trainable = False
-        model = keras.Sequential([self.generator, self.discriminator])
-        model.compile(optimizer="adam", loss="binary_crossentropy")
+    def _build_discriminator(self):
+        model = keras.Sequential([
+            layers.Flatten(input_shape=(self.sequence_length, self.input_dim)),
+            layers.Dense(512),
+            layers.LeakyReLU(alpha=0.2),
+            layers.Dense(256),
+            layers.LeakyReLU(alpha=0.2),
+            layers.Dense(1, activation='sigmoid')
+        ])
         return model
     
     def train(self, real_data:np.ndarray, epochs:int=100, batch_size:int=32) -> None:
@@ -57,10 +87,11 @@ class GAN:
             d_loss_fake = self.discriminator.train_on_batch(fake_samples, np.zeros((batch_size, 1)))
             d_loss = 0.5 * np.add(d_loss_real, d_loss_fake)
             # Train generator
-            noise = np.random_normal(0,1,(batch_size, self.latent_dim))
+            noise = np.random.normal(0,1,(batch_size, self.latent_dim))
             g_loss = self.gan.train_on_batch(noise, np.ones((batch_size, 1)))
             if epoch % 100 == 0:
                 print(f"Epoch {epoch}, D_Loss: {d_loss}, G_loss: {g_loss}")
+                
     def generate(self, num_samples:int) -> np.ndarray:
         """
         Generate synthetic data using the trained generator.
