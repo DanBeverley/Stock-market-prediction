@@ -1,24 +1,47 @@
+import os
+import joblib
 import pandas as pd
 from typing import List, Callable, Dict, Any
-from sklearn.preprocessing import StandardScaler, LabelEncoder
+from sklearn.preprocessing import StandardScaler, MinMaxScaler, LabelEncoder, OneHotEncoder
 
 class DataPreprocessor:
-    def __init__(self, preprocessing_steps:List[Callable[[pd.DataFrame], pd.DataFrame]]=None,
-                 feature_configs:Dict[str, Any]=None) -> None:
+    def __init__(self, feature_configs:Optiona[Dict[str, Any]]=None) -> None:
         """
         Initialize the DataPreprocessor.
 
         Args:
-            preprocessing_steps (List[Callable[[pd.DataFrame], pd.DataFrame]], optional): 
-                List of functions to apply to the data. Each function takes a DataFrame and returns a 
-                processed DataFrame. Defaults to None.
-            feature_configs (Dict[str, Any], optional): Configuration for specific feature transformations 
-                (e.g., {'numerical': ['col1', 'col2'], 'categorical': ['col3']}). Defaults to None.
+            feature_configs (Dict[str, Any], optional): Configuration for feature transformations.
+                Example:
+                {
+                    'numerical': ['col1', 'col2'],
+                    'categorical': ['col3'],
+                    'date_column': 'Date', # If time features needed
+                    'scaling_strategy': 'standard', # 'standard' or 'minmax'
+                    'encoding_strategy': 'label', # 'label' or 'onehot'
+                    'time_features': { # Optional section for time series
+                       'lags': [1, 3, 7],
+                       'windows': [7, 14],
+                       'add_date_components': True
+                    }
+                }
+                Defaults to None (no scaling/encoding unless methods are called manually).
         """
-        self.preprocessing_steps = preprocessing_steps or []
         self.feature_configs = feature_configs or {}
         self.transformers:Dict[str, Any] = {}
-    
+        self._is_fitted = False
+
+    def _validate_columns(self, data:pd.DataFrame, column_type:str) -> None:
+        """Helper to validate column existence"""
+        if column_type in self.feature_configs:
+            cols = self.feature_configs[column_type]
+            if isinstance(col, list):
+                missing_cols = [col for col in cols if col not in data.columns]
+                if missing_cols:
+                    raise ValueError(f"'{column_type}' columns not found in data: {missing_cols}")
+            elif isinstance(cols, str):
+                if cols not in data.columns:
+                    raise ValueError(f"'{column_type}' column '{cols}' not found in data")
+                
     def fit(self, data:pd.DataFrame) -> None:
         """
         Fit the preprocessor to the data, initializing transformers based on feature_configs.
@@ -30,21 +53,49 @@ class DataPreprocessor:
         """
         if not isinstance(data, pd.DataFrame):
             raise ValueError("Input must be a pandas DataFrame")
+        if data.empty:
+            raise ValueError("Input DataFrame is empty")
+        self._validate_columns(data, "numerical")
+        self._validate_columns(data, "categorical")
         # Fit transformers based on feature configurations
-        if "numerical" in self.feature_configs:
-            scaler = StandardScaler()
+        self.transformers = {}
+
+        if "numerical" in self.feature_configs and self.feature_configs["numerical"]:
             num_cols = self.feature_configs["numerical"]
-            if not set(num_cols).issubset(data.columns):
-                raise ValueError("Numerical column in feature_configs not found")
+            # Defaut to standard if not specified
+            strategy = self.feature_configs.get("scaling_strategy", "standard").lower()
+            if strategy == "minmax":
+                feature_range = self.feature_configs.get("scaling_range", (0,1))
+                print("Fitting MinMaxScaler with range {feature_range} on columns: {num_cols}")
+                scaler = MinMaxScaler(feature_range=feature_range)
+            elif strategy == "standard":
+                print(f"Fitting StandardScaler on columns: {num_cols}")
+                scaler = StandardScaler()
+            else:
+                raise ValueError(f"Unsupported scaling_strategy: {strategy}. Choose 'standard' or 'minmax'.")
+            
+            # Ensure columns exist before fitting
+            missing_cols = [col for col in num_cols if col not in data.columns]
+            if missing_cols:
+                raise ValueError(f"Numerical columns for scaling not found in data: {missing_cols}")
             self.transformers["scaler"] = scaler.fit(data[num_cols])
-        
-        if "categorical" in self.feature_configs:
+            self.transformers["numerical_cols"] = num_cols
+
+        if "categorical" in self.feature_configs and self.feature_configs["categorical"]:
             cat_cols = self.feature_configs["categorical"]
-            if not set(cat_cols).issubset(data.columns):
-                raise ValueError("Categorical columns in feature_configs not found")
-            self.transformers["encoders"] = {
-                col:LabelEncoder().fit(data[col]) for col in cat_cols
-            }
+            strategy = self.feature_configs.get("encoding_strategy", "label").lower()
+            if strategy == "label":
+                self.transformers["encoders"] = {col:LabelEncoder().fit(data[col].astype()str)} for col in cat_cols
+            elif strategy == "onehot":
+                encoder = OneHotEncoder(handle_unknown="ignore", sparse_output=False)
+                self.transformers["onehot_encoder"] = encoder.fit(data[cat_cols])
+                # Store feature name generated by OneHotEncoder
+                self.transformers["onehot_features"] = encoder.get_feature_names_out(cat_cols).tolist()
+            else:
+                raise ValueError(f"Unsupported encoding_strategy: {strategy}")
+            self.transformers["categorical_cols"] = cat_cols
+        self._is_fitted = True
+        print("Preprocessor fitted")
     
     def transform(self, data:pd.DataFrame) -> pd.DataFrame:
         """
@@ -59,26 +110,42 @@ class DataPreprocessor:
         Raises:
             ValueError: If transformers are not fitted or columns are missing.
         """
+        if not self._is_fitted:
+            raise ValueError("Preprocessor has not been fitted. Call fit() first")
         if not isinstance(data, pd.DataFrame):
-            raise ValueError("Input must be a pandas DataFrame")
+            raise TypeError("Input 'data' must be a pandas DataFrame")
         processed_data = data.copy()
-
+        # Apply scaler
         if "scaler" in self.transformers:
-            num_cols = self.feature_configs["numerical"]
-            if not set(num_cols).issubset(processed_data.columns):
-                raise ValueError("Numerical columns missing in data for transformation")
+            num_cols = self.transformers["numerical_cols"]
+            self._validate_columns(processed_data, "numerical") # Check cols exist in data to transform
             processed_data[num_cols] = self.transformers["scaler"].transform(processed_data[num_cols])
-        
-        if "encoders" in self.transformers:
-            for col, encoder in self.transformers["encoders"].items():
-                if col not in processed_data.columns:
-                    raise ValueError(f"Categorical column '{col}' missing in data for transformation")
-                processed_data[col] = encoder.transform(processed_data[col])
-        
-        for step in self.preprocessing_steps:
-            processed_data = step(processed_data)
 
-        return processed_data
+        # Apply encoders
+        if "encoders" in self.transformers: # Label encoding
+            cat_cols = self.transformers["categorical_cols"]
+            self._validate_columns(processed_data, "categorical")
+            for col, encoder in self.transformers["encoders"].items():
+                # Handle potential unseen labels during transfrom if LabelEncoder used
+                processed_data[col] = processed_data[col].astype(str).apply(lambda x:encoder.transform([x])[0] if x in encoder.classes_ else - 1)
+                if (processed_data[col] == -1).any():
+                    print(f"Warning: Unseen labels encountered in column '{col}' during transform, mapped to -1")
+        elif "onehot_encoder" in self.transformers:
+            cat_cols = self.transformers["categorical_cols"]
+            self._validate_columns(processed_data, "categorical")
+            encoded_features = self.transformers["onehot_encoder"].transform(processed_data[cat_cols])
+            encoded_df = pd.DataFrame(encoded_features, columns = self.transformers["onehot_features"],
+                                      index = processed_data.index)
+            processed_data = pd.concat([processed_data.drop(columns = cat_cols), encoded_df], axis = 1)
+
+            # Apply time series features if specified in config
+            if "time_features" in self.feature_configs and "date_column" in self.feature_configs:
+                if self.feature_configs["date_column"] in processed_data.columns:
+                    processed_data = self.add_time_series_features(processed_data)
+                else:
+                    print(f"Warning: Date column '{self.feature_config['date_column']}' not found. Skipping time series features")
+            
+            return processed_data
 
     def fit_transform(self, data:pd.DataFrame) -> pd.DataFrame:
         """
@@ -95,7 +162,7 @@ class DataPreprocessor:
         """
         self.fit(data)
         return self.transform(data)
-    
+
     def validate_data(self, data:pd.DataFrame) -> Dict[str, Any]:
         """
         Validate the dataset and return a report of issues (e.g., missing values, data types).
@@ -111,12 +178,23 @@ class DataPreprocessor:
         """
         if not isinstance(data, pd.DataFrame):
             raise ValueError("Input must be a pandas DataFrame")
-        validation_report = {
-            "missing_values":data.isnull().sum().to_dict(),
-            "data_types":data.dtypes.to_dict(),
-            "shape":data.shape
-        }
-        return validation_report
+        report = {
+            "shape":data.shape,
+            "missing_values_count":data.isnull().sum().to_dict(),
+            "missing_values_percent":(data.isnull().sum()/len(data)*100).round(2).to_dict(),
+            "data_types":data.dtypes.apply(lambda x:str(x)).to_dict(),
+            "unique_counts":{col:data[col].nunique() for col in data.columns if data[col].dtype == "object" or data[col].nunique() < 20}}
+        print("--- Data Validation Report ---")
+        print(f"Shape: {report['shape']}")
+        print("\nMissing Values (%):")
+        for col, pct in report['missing_values_percent'].items():
+             if pct > 0:
+                  print(f"  {col}: {pct}% ({report['missing_values_count'][col]})")
+        print("\nData Types:")
+        for col, dtype in report['data_types'].items():
+             print(f"  {col}: {dtype}")
+        #TODO: Add more checks (e.g., using Pandera or Great Expectations for complex rules)
+        return report
     
     def add_preprocessing_step(self, step:Callable[[pd.DataFrame], pd.DataFrame]) -> None:
         """
@@ -140,24 +218,89 @@ class DataPreprocessor:
             pd.DataFrame: DataFrame with additional time series features
         """
         df = data.copy()
-        if date_column in df.columns:
-            df[date_column] = pd.to_datetime(df[date_column])
-            # Extract datetime components
-            df['year'] = df[date_column].dt.year
-            df['month'] = df[date_column].dt.month
-            df['day'] = df[date_column].dt.day
-            df['day_of_week'] = df[date_column].dt.dayofweek
-            df['is_month_end'] = df[date_column].dt.is_month_end.astype(int)
-        if "numerical" in self.feature_configs:
-            for col in self.feature_configs["numerical"]:
-                for lag in [1,2,3,5,7,14,21]:
+        config = self.feature_configs.get("time_features", {})
+        date_col = self.feature_configs.get("date_column")
+        if not date_col or date_col not in df.columns:
+            raise ValueError(f"Date column '{date_col}' not configured or not found in DataFrame")
+        try:
+            df[date_col] = pd.to_datetime(df[date_col])
+            # It's often beneficial to set the date column as index for time-series ops
+            # df = df.set_index(date_col).sort_index() # Optional, depends on workflow
+        except Exception as e:
+            raise ValueError(f"Could not parse date column '{date_col}':{e}")
+        # Add date components (Year, Month, Day, etc.)
+        if config.get("add_date_components", False):
+            df[f'{date_col}_year'] = df[date_col].dt.year
+            df[f'{date_col}_month'] = df[date_col].dt.month
+            df[f'{date_col}_day'] = df[date_col].dt.day
+            df[f'{date_col}_dayofweek'] = df[date_col].dt.dayofweek
+            df[f'{date_col}_dayofyear'] = df[date_col].dt.dayofyear
+            df[f'{date_col}_weekofyear'] = df[date_col].dt.isocalendar().week.astype(int)
+            df[f'{date_col}_quarter'] = df[date_col].dt.quarter
+            df[f'{date_col}_is_month_start'] = df[date_col].dt.is_month_start.astype(int)
+            df[f'{date_col}_is_month_end'] = df[date_col].dt.is_month_end.astype(int)
+        # TODO: Consider adding indicators for holidays if relevant
+        # Add Lags and Rolling Features for numerical columns
+        num_cols = self.feature_configs.get("numerical", [])
+        lags = config.get("lags", [])
+        windows = config.get("windows", [])
+
+        if not num_cols:
+             print("Warning: No numerical columns defined in config for lag/rolling features.")
+             return df # Return early if no columns to process
+
+        print(f"Adding time features: lags={lags}, windows={windows} for columns: {num_cols}")
+
+        # Important: Ensure data is sorted by date for lags/rolling features to be meaningful
+        df = df.sort_values(by=date_col)
+        for col in num_cols:
+            if col in df.columns: # Ensure column exists after potential encoding charges
+                # Lags
+                for lag in lags:
                     df[f"{col}_lag_{lag}"] = df[col].shift(lag)
-                # Add rolling statistics
-                for window in [7,14,30]:
-                    df[f'{col}_rolling_mean_{window}'] = df[col].rolling(window=window).mean()
-                    df[f'{col}_rolling_std_{window}'] = df[col].rolling(window=window).std()
-                    
-                # Add rate of change
-                df[f'{col}_pct_change'] = df[col].pct_change()
+                # Rolling statistics
+                for window in windows:
+                    if len(df) >= window:
+                        df[f"{col}_rolling_mean_{window}"] = df[col].rolling(window=window, min_periods=1).mean()
+                        df[f"{col}_rolling_std_{window}"] = df[col].rolling(window=window, min_periods=1).std()
+                    else:
+                        print(f"Warning: window size {window} > data length {len(df)} for column {col}. Skipping rolling features")
+        # Handle NaNs introduced by shift/rolling
+        # Strategies: forward fill, backward fill, drop rows, impute
+        # Simple approach: backfill then forward fill
+        initial_len = len(df)
+        df.dropna(inplace = True)
+        print(f"Dropped {initial_len - len(df)} rows with NaNs after adding time features")
         return df
     
+    def save(self, filepath: str) -> None:
+        """Save the fitted preprocessor state (transformers and config)."""
+        if not self._is_fitted:
+             print("Warning: Preprocessor is not fitted. Saving configuration only.")
+        state = {
+            "feature_configs": self.feature_configs,
+            "transformers": self.transformers,
+            "_is_fitted": self._is_fitted
+        }
+        try:
+            # Ensure directory exists
+            os.makedirs(os.path.dirname(filepath), exist_ok=True)
+            joblib.dump(state, filepath)
+            print(f"Preprocessor state saved to {filepath}")
+        except Exception as e:
+            print(f"Error saving preprocessor state: {e}")
+
+    @classmethod
+    def load(cls, filepath: str) -> 'DataPreprocessor':
+        """Load a saved preprocessor state."""
+        try:
+            state = joblib.load(filepath)
+            preprocessor = cls(feature_configs=state["feature_configs"])
+            preprocessor.transformers = state["transformers"]
+            preprocessor._is_fitted = state["_is_fitted"]
+            print(f"Preprocessor state loaded from {filepath}")
+            return preprocessor
+        except FileNotFoundError:
+            raise FileNotFoundError(f"Preprocessor state file not found at: {filepath}")
+        except Exception as e:
+            raise IOError(f"Error loading preprocessor state from {filepath}: {e}")
