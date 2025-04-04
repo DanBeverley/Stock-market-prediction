@@ -1,11 +1,26 @@
 import os
 import joblib
 import pandas as pd
-from typing import List, Callable, Dict, Any
+import numpy as np
+from typing import List, Callable, Dict, Any, Optional
 from sklearn.preprocessing import StandardScaler, MinMaxScaler, LabelEncoder, OneHotEncoder
+try:
+    import pandera as pa
+    from pandera.typing import DataFrame, Series
+    PANDERA_AVAILABLE = True
+except ImportError:
+    PANDERA_AVAILABLE = False
+    print("Pandera not installed. Advanced data validation will be limited.")
+
+try:
+    from holidays import country_holidays
+    HOLIDAYS_AVAILABLE = True
+except ImportError:
+    HOLIDAYS_AVAILABLE = False
+    print("Holidays package not installed. Holiday features will not be available.")
 
 class DataPreprocessor:
-    def __init__(self, feature_configs:Optiona[Dict[str, Any]]=None) -> None:
+    def __init__(self, feature_configs:Optional[Dict[str, Any]]=None) -> None:
         """
         Initialize the DataPreprocessor.
 
@@ -34,7 +49,7 @@ class DataPreprocessor:
         """Helper to validate column existence"""
         if column_type in self.feature_configs:
             cols = self.feature_configs[column_type]
-            if isinstance(col, list):
+            if isinstance(cols, list):
                 missing_cols = [col for col in cols if col not in data.columns]
                 if missing_cols:
                     raise ValueError(f"'{column_type}' columns not found in data: {missing_cols}")
@@ -85,7 +100,7 @@ class DataPreprocessor:
             cat_cols = self.feature_configs["categorical"]
             strategy = self.feature_configs.get("encoding_strategy", "label").lower()
             if strategy == "label":
-                self.transformers["encoders"] = {col:LabelEncoder().fit(data[col].astype()str)} for col in cat_cols
+                self.transformers["encoders"] = {col:LabelEncoder().fit(data[col].astype(str)) for col in cat_cols}
             elif strategy == "onehot":
                 encoder = OneHotEncoder(handle_unknown="ignore", sparse_output=False)
                 self.transformers["onehot_encoder"] = encoder.fit(data[cat_cols])
@@ -183,7 +198,84 @@ class DataPreprocessor:
             "missing_values_count":data.isnull().sum().to_dict(),
             "missing_values_percent":(data.isnull().sum()/len(data)*100).round(2).to_dict(),
             "data_types":data.dtypes.apply(lambda x:str(x)).to_dict(),
-            "unique_counts":{col:data[col].nunique() for col in data.columns if data[col].dtype == "object" or data[col].nunique() < 20}}
+            "unique_counts":{col:data[col].nunique() for col in data.columns if data[col].dtype == "object" or data[col].nunique() < 20},
+            "validation_errors": []
+        }
+        
+        # Basic statistics for numerical columns
+        num_cols = [col for col in data.columns if pd.api.types.is_numeric_dtype(data[col])]
+        if num_cols:
+            report["numerical_stats"] = {
+                "min": data[num_cols].min().to_dict(),
+                "max": data[num_cols].max().to_dict(),
+                "mean": data[num_cols].mean().to_dict(),
+                "median": data[num_cols].median().to_dict(),
+                "std": data[num_cols].std().to_dict(),
+                "skew": data[num_cols].skew().to_dict(),
+                "outliers": {}
+            }
+            
+            # Check for outliers using IQR method
+            for col in num_cols:
+                Q1 = data[col].quantile(0.25)
+                Q3 = data[col].quantile(0.75)
+                IQR = Q3 - Q1
+                lower_bound = Q1 - 1.5 * IQR
+                upper_bound = Q3 + 1.5 * IQR
+                outliers = data[(data[col] < lower_bound) | (data[col] > upper_bound)]
+                report["numerical_stats"]["outliers"][col] = len(outliers)
+        
+        # Advanced validation with Pandera if available
+        if PANDERA_AVAILABLE and self.feature_configs:
+            try:
+                # Create a schema based on feature_configs
+                schema_dict = {"columns": {}}
+                
+                # Add checks for numerical columns
+                if "numerical" in self.feature_configs:
+                    for col in self.feature_configs["numerical"]:
+                        if col in data.columns:
+                            schema_dict["columns"][col] = pa.Column(
+                                pa.Float, 
+                                nullable=False,
+                                checks=[
+                                    pa.Check.not_nan(),
+                                    pa.Check(lambda x: ~np.isinf(x), error="infinity values detected")
+                                ]
+                            )
+                
+                # Add checks for categorical columns
+                if "categorical" in self.feature_configs:
+                    for col in self.feature_configs["categorical"]:
+                        if col in data.columns:
+                            unique_vals = data[col].unique().tolist()
+                            schema_dict["columns"][col] = pa.Column(
+                                pa.String if data[col].dtype == "object" else data[col].dtype,
+                                checks=[pa.Check.isin(unique_vals)]
+                            )
+                
+                # Add date column check
+                if "date_column" in self.feature_configs:
+                    date_col = self.feature_configs["date_column"]
+                    if date_col in data.columns:
+                        schema_dict["columns"][date_col] = pa.Column(
+                            pa.DateTime,
+                            checks=[
+                                pa.Check(lambda x: pd.notna(x), error="date cannot be null")
+                            ]
+                        )
+                
+                # Create and validate with schema
+                schema = pa.DataFrameSchema(**schema_dict)
+                try:
+                    schema.validate(data, lazy=True)
+                except pa.errors.SchemaErrors as e:
+                    report["validation_errors"] = e.failure_cases.to_dict(orient="records")
+            
+            except Exception as e:
+                print(f"Pandera schema validation error: {e}")
+                report["validation_errors"].append(str(e))
+        
         print("--- Data Validation Report ---")
         print(f"Shape: {report['shape']}")
         print("\nMissing Values (%):")
@@ -193,7 +285,26 @@ class DataPreprocessor:
         print("\nData Types:")
         for col, dtype in report['data_types'].items():
              print(f"  {col}: {dtype}")
-        #TODO: Add more checks (e.g., using Pandera or Great Expectations for complex rules)
+             
+        # Print numerical stats summary
+        if "numerical_stats" in report:
+            print("\nNumerical Column Statistics:")
+            for col in num_cols:
+                print(f"  {col}:")
+                print(f"    Range: {report['numerical_stats']['min'][col]} to {report['numerical_stats']['max'][col]}")
+                print(f"    Mean: {report['numerical_stats']['mean'][col]:.2f}, Median: {report['numerical_stats']['median'][col]:.2f}")
+                print(f"    Standard Deviation: {report['numerical_stats']['std'][col]:.2f}")
+                print(f"    Skewness: {report['numerical_stats']['skew'][col]:.2f}")
+                print(f"    Potential Outliers: {report['numerical_stats']['outliers'][col]}")
+        
+        # Print validation errors
+        if report["validation_errors"]:
+            print("\nValidation Errors:")
+            for error in report["validation_errors"][:10]:  # Show first 10 errors
+                print(f"  {error}")
+            if len(report["validation_errors"]) > 10:
+                print(f"  ... and {len(report['validation_errors']) - 10} more errors")
+        
         return report
     
     def add_preprocessing_step(self, step:Callable[[pd.DataFrame], pd.DataFrame]) -> None:
@@ -239,7 +350,63 @@ class DataPreprocessor:
             df[f'{date_col}_quarter'] = df[date_col].dt.quarter
             df[f'{date_col}_is_month_start'] = df[date_col].dt.is_month_start.astype(int)
             df[f'{date_col}_is_month_end'] = df[date_col].dt.is_month_end.astype(int)
-        # TODO: Consider adding indicators for holidays if relevant
+            
+            # Add weekend indicator
+            df[f'{date_col}_is_weekend'] = df[date_col].dt.dayofweek.isin([5, 6]).astype(int)
+        
+        # Add holiday indicators if configured and holidays package is available
+        if config.get("add_holidays", False):
+            country_code = config.get("holiday_country", "US")
+            if HOLIDAYS_AVAILABLE:
+                # Get min and max year from the dataset
+                min_year = df[date_col].dt.year.min()
+                max_year = df[date_col].dt.year.max()
+                
+                # Get holidays for the relevant years
+                try:
+                    holidays_dict = country_holidays(country_code, years=range(min_year, max_year + 1))
+                    
+                    # Add holiday indicator
+                    df[f'{date_col}_is_holiday'] = df[date_col].dt.date.isin(holidays_dict.keys()).astype(int)
+                    
+                    # Add holiday name (if it's a holiday)
+                    holiday_names = df[date_col].dt.date.apply(lambda x: holidays_dict.get(x, ""))
+                    df[f'{date_col}_holiday_name'] = holiday_names
+                    
+                    # Add days to/from nearest holiday
+                    date_series = pd.Series(df[date_col].dt.date)
+                    holiday_dates = sorted(holidays_dict.keys())
+                    
+                    # Function to find distance to nearest holiday
+                    def days_to_nearest_holiday(date):
+                        if date in holidays_dict:
+                            return 0
+                        
+                        # Find closest holiday date
+                        days_to_holiday = [abs((date - hdate).days) for hdate in holiday_dates]
+                        return min(days_to_holiday) if days_to_holiday else 999
+                    
+                    df[f'{date_col}_days_to_holiday'] = date_series.apply(days_to_nearest_holiday)
+                    
+                    # Add special market periods if specified
+                    if config.get("add_market_periods", False):
+                        # Tax season indicators (US-centric, adjust as needed)
+                        df[f'{date_col}_is_tax_season'] = ((df[date_col].dt.month >= 1) & 
+                                                          (df[date_col].dt.month <= 4)).astype(int)
+                        
+                        # Quarter end indicator (often important for financial markets)
+                        df[f'{date_col}_is_quarter_end'] = df[date_col].dt.is_quarter_end.astype(int)
+                        
+                        # End of fiscal year indicator 
+                        df[f'{date_col}_is_year_end'] = ((df[date_col].dt.month == 12) & 
+                                                        (df[date_col].dt.day >= 28)).astype(int)
+                    
+                    print(f"Added holiday indicators for {country_code}")
+                except Exception as e:
+                    print(f"Error adding holidays for {country_code}: {e}")
+            else:
+                print("Warning: 'holidays' package not available. Install with 'pip install holidays'")
+        
         # Add Lags and Rolling Features for numerical columns
         num_cols = self.feature_configs.get("numerical", [])
         lags = config.get("lags", [])
